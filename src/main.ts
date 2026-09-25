@@ -278,7 +278,7 @@ function renderUploadView(): string {
 
         <div class="upload-footnote">
           <span>Maximum 3 MB</span>
-          <span>No application storage</span>
+          <span>Sent securely to Gemini for analysis</span>
         </div>
       </div>
     </section>
@@ -487,7 +487,7 @@ function renderAskSection(analysis: AnalysisResult): string {
       <div class="chat-card">
         ${
           state.messages.length
-            ? `<div class="chat-messages" id="chat-messages">${state.messages.map(renderChatMessage).join('')}</div>`
+            ? `<div class="chat-messages" id="chat-messages" role="log" aria-live="polite" aria-relevant="additions">${state.messages.map(renderChatMessage).join('')}</div>`
             : `
               <div class="chat-empty">
                 <span class="chat-empty-icon" aria-hidden="true">?</span>
@@ -514,7 +514,7 @@ function renderAskSection(analysis: AnalysisResult): string {
 
         ${
           state.isAsking
-            ? '<div class="typing-indicator" aria-label="ClausePilot is answering"><span></span><span></span><span></span></div>'
+            ? '<div class="typing-indicator" role="status" aria-live="polite" aria-label="ClausePilot is answering"><span></span><span></span><span></span></div>'
             : ''
         }
 

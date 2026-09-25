@@ -1,7 +1,7 @@
 import {
   analyzeRequestBody,
   requestBody,
-  requirePost,
+  requireApiRequest,
   sendApiError,
   type ApiRequest,
   type ApiResponse,
@@ -9,7 +9,7 @@ import {
 
 export default async function handler(request: ApiRequest, response: ApiResponse) {
   try {
-    requirePost(request, response)
+    requireApiRequest(request, response)
     const analysis = await analyzeRequestBody(requestBody(request))
     response.status(200).json({ analysis })
   } catch (error) {

@@ -3,7 +3,10 @@ import type {
   ApiErrorResponse,
   AskRequest,
   AskResult,
+  Citation,
   DocumentPayload,
+  KeyTerm,
+  RiskFlag,
 } from './types'
 
 const MAX_FILE_SIZE = 3 * 1024 * 1024
@@ -23,6 +26,105 @@ export class ClientApiError extends Error {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isCitation(value: unknown): value is Citation {
+  if (!isRecord(value) || !isNonEmptyString(value.excerpt) || !isRecord(value.locator)) {
+    return false
+  }
+
+  if (value.locator.kind === 'pdf_page') {
+    return Number.isInteger(value.locator.page) && (value.locator.page as number) >= 1
+  }
+
+  return (
+    value.locator.kind === 'text_section' &&
+    isNonEmptyString(value.locator.section) &&
+    Number.isInteger(value.locator.lineStart) &&
+    Number.isInteger(value.locator.lineEnd) &&
+    (value.locator.lineStart as number) >= 1 &&
+    (value.locator.lineEnd as number) >= (value.locator.lineStart as number)
+  )
+}
+
+function isCitationList(value: unknown): value is Citation[] {
+  return Array.isArray(value) && value.every(isCitation)
+}
+
+function isKeyTerm(value: unknown): value is KeyTerm {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.term) &&
+    isNonEmptyString(value.value) &&
+    isNonEmptyString(value.explanation) &&
+    isCitationList(value.citations)
+  )
+}
+
+function isRiskFlag(value: unknown): value is RiskFlag {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.title) &&
+    isNonEmptyString(value.category) &&
+    (value.severity === 'low' || value.severity === 'medium' || value.severity === 'high') &&
+    isNonEmptyString(value.whyItMatters) &&
+    isNonEmptyString(value.suggestedNextStep) &&
+    isCitationList(value.citations)
+  )
+}
+
+function assertAnalysisResult(value: unknown): asserts value is AnalysisResult {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.documentTitle) ||
+    !isNonEmptyString(value.documentType) ||
+    !isRecord(value.summary) ||
+    !isNonEmptyString(value.summary.text) ||
+    !isCitationList(value.summary.citations) ||
+    !Array.isArray(value.keyTerms) ||
+    !value.keyTerms.every(isKeyTerm) ||
+    !Array.isArray(value.riskFlags) ||
+    !value.riskFlags.every(isRiskFlag) ||
+    !Array.isArray(value.suggestedQuestions) ||
+    !value.suggestedQuestions.every(isNonEmptyString)
+  ) {
+    throw new ClientApiError('The server returned an invalid response.', 'INVALID_RESPONSE', 502)
+  }
+}
+
+function assertAskResult(value: unknown): asserts value is AskResult {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.answer) ||
+    typeof value.notFound !== 'boolean' ||
+    !isCitationList(value.citations) ||
+    !Array.isArray(value.followUpQuestions) ||
+    !value.followUpQuestions.every(isNonEmptyString)
+  ) {
+    throw new ClientApiError('The server returned an invalid response.', 'INVALID_RESPONSE', 502)
+  }
+}
+
+function assertAnalysisEnvelope(value: unknown): asserts value is { analysis: AnalysisResult } {
+  if (!isRecord(value) || !isRecord(value.analysis)) {
+    throw new ClientApiError('The server returned an invalid response.', 'INVALID_RESPONSE', 502)
+  }
+  assertAnalysisResult(value.analysis)
+}
+
+function assertAskEnvelope(value: unknown): asserts value is { answer: AskResult } {
+  if (!isRecord(value) || !isRecord(value.answer)) {
+    throw new ClientApiError('The server returned an invalid response.', 'INVALID_RESPONSE', 502)
+  }
+  assertAskResult(value.answer)
+}
+
 export function validateDocumentFile(file: File): void {
   const lowerName = file.name.toLowerCase()
   const hasAllowedExtension = ALLOWED_EXTENSIONS.some((extension) =>
@@ -33,8 +135,16 @@ export function validateDocumentFile(file: File): void {
     throw new ClientApiError('Choose a PDF, TXT, or Markdown document.', 'UNSUPPORTED_FILE')
   }
 
-  if (file.type && !ALLOWED_MIME_TYPES.has(file.type.toLowerCase())) {
-    throw new ClientApiError('Choose a PDF, TXT, or Markdown document.', 'UNSUPPORTED_FILE')
+  if (file.type) {
+    const mimeType = file.type.toLowerCase()
+    const isPdf = lowerName.endsWith('.pdf')
+    const isText = lowerName.endsWith('.txt') || lowerName.endsWith('.md')
+    if (!ALLOWED_MIME_TYPES.has(mimeType) || (isPdf && mimeType !== 'application/pdf')) {
+      throw new ClientApiError('Choose a PDF, TXT, or Markdown document.', 'UNSUPPORTED_FILE')
+    }
+    if (isText && mimeType !== 'text/plain' && mimeType !== 'text/markdown') {
+      throw new ClientApiError('Choose a PDF, TXT, or Markdown document.', 'UNSUPPORTED_FILE')
+    }
   }
 
   if (file.size === 0) {
@@ -73,9 +183,10 @@ export async function createDocumentPayload(file: File): Promise<DocumentPayload
 async function postJson<ResponseBody>(
   endpoint: string,
   body: DocumentPayload | AskRequest,
+  validate: (value: unknown) => asserts value is ResponseBody,
 ): Promise<ResponseBody> {
   const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  const timeout = globalThis.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
 
   try {
     const response = await fetch(endpoint, {
@@ -98,11 +209,8 @@ async function postJson<ResponseBody>(
       )
     }
 
-    if (!payload || typeof payload !== 'object') {
-      throw new ClientApiError('The server returned an invalid response.', 'INVALID_RESPONSE')
-    }
-
-    return payload as ResponseBody
+    validate(payload)
+    return payload
   } catch (error) {
     if (error instanceof ClientApiError) {
       throw error
@@ -120,14 +228,18 @@ async function postJson<ResponseBody>(
       'NETWORK_ERROR',
     )
   } finally {
-    window.clearTimeout(timeout)
+    globalThis.clearTimeout(timeout)
   }
 }
 
 export async function analyzeDocument(
   documentPayload: DocumentPayload,
 ): Promise<AnalysisResult> {
-  const response = await postJson<{ analysis: AnalysisResult }>('/api/analyze', documentPayload)
+  const response = await postJson<{ analysis: AnalysisResult }>(
+    '/api/analyze',
+    documentPayload,
+    assertAnalysisEnvelope,
+  )
   return response.analysis
 }
 
@@ -136,10 +248,14 @@ export async function askDocument(
   question: string,
   history: NonNullable<AskRequest['history']>,
 ): Promise<AskResult> {
-  const response = await postJson<{ answer: AskResult }>('/api/ask', {
-    ...documentPayload,
-    question,
-    history,
-  })
+  const response = await postJson<{ answer: AskResult }>(
+    '/api/ask',
+    {
+      ...documentPayload,
+      question,
+      history,
+    },
+    assertAskEnvelope,
+  )
   return response.answer
 }

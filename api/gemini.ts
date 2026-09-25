@@ -10,6 +10,20 @@ import type {
 } from '../src/types.js'
 
 const MAX_DOCUMENT_BYTES = 3 * 1024 * 1024
+const MAX_REQUEST_BODY_CHARS = Math.ceil(MAX_DOCUMENT_BYTES * 4 / 3) + 100_000
+const MAX_TEXT_CHARACTERS = 1_000_000
+const MAX_MODEL_TEXT_LENGTH = 12_000
+const MAX_MODEL_RESPONSE_CHARS = 100_000
+const MAX_CITATIONS = 20
+const MAX_KEY_TERMS = 20
+const MAX_RISK_FLAGS = 20
+const MAX_SUGGESTED_QUESTIONS = 8
+const MAX_FOLLOW_UP_QUESTIONS = 5
+const GENERATION_DEADLINE_MS = 55_000
+const MAX_GENERATION_CALLS = 2
+const FALLBACK_DELAY_MS = 100
+const RATE_LIMIT_WINDOW_MS = 60_000
+const RATE_LIMIT_MAX_REQUESTS = 10
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite'
 const FALLBACK_MODEL = 'gemini-3.1-flash-lite-preview'
 
@@ -231,7 +245,13 @@ interface PreparedDocument {
   textContent?: string
 }
 
+interface GenerationContext {
+  signal: AbortSignal
+  calls: number
+}
+
 let client: GoogleGenAI | undefined
+const requestBuckets = new Map<string, { count: number; resetAt: number }>()
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -257,7 +277,23 @@ function getModel(): string {
 
 function getRequestBody(request: ApiRequest): unknown {
   if (typeof request.body !== 'string') {
+    if (request.body !== undefined && request.body !== null) {
+      try {
+        if (JSON.stringify(request.body).length > MAX_REQUEST_BODY_CHARS) {
+          throw new PublicError(413, 'REQUEST_TOO_LARGE', 'The request is too large.')
+        }
+      } catch (error) {
+        if (error instanceof PublicError) {
+          throw error
+        }
+        throw new PublicError(400, 'INVALID_REQUEST', 'The request body is invalid.')
+      }
+    }
     return request.body
+  }
+
+  if (request.body.length > MAX_REQUEST_BODY_CHARS) {
+    throw new PublicError(413, 'REQUEST_TOO_LARGE', 'The request is too large.')
   }
 
   try {
@@ -272,7 +308,11 @@ function cleanFileName(value: unknown): string {
     throw new PublicError(400, 'INVALID_FILE', 'A document name is required.')
   }
 
-  const name = value.split(/[\\/]/).at(-1)?.replace(/[\u0000-\u001f\u007f]/g, '').trim()
+  const name = value
+    .split(/[\\/]/)
+    .at(-1)
+    ?.replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, '')
+    .trim()
   if (!name) {
     throw new PublicError(400, 'INVALID_FILE', 'A document name is required.')
   }
@@ -283,6 +323,10 @@ function cleanFileName(value: unknown): string {
 function decodeDocumentData(value: unknown): Buffer {
   if (typeof value !== 'string' || value.length === 0) {
     throw new PublicError(400, 'INVALID_FILE', 'Document data is required.')
+  }
+
+  if (value.length > Math.ceil(MAX_DOCUMENT_BYTES * 4 / 3) + 4) {
+    throw new PublicError(413, 'FILE_TOO_LARGE', 'Choose a document smaller than 3 MB.')
   }
 
   if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
@@ -310,6 +354,11 @@ function prepareDocument(value: unknown): PreparedDocument {
     throw new PublicError(400, 'INVALID_REQUEST', 'A document is required.')
   }
 
+  const allowedKeys = new Set(['name', 'mimeType', 'data', 'question', 'history'])
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw new PublicError(400, 'INVALID_REQUEST', 'The request contains unsupported fields.')
+  }
+
   const name = cleanFileName(value.name)
   const mimeType = value.mimeType
 
@@ -321,14 +370,29 @@ function prepareDocument(value: unknown): PreparedDocument {
     )
   }
 
+  const lowerName = name.toLowerCase()
+  const extensionMatches =
+    (mimeType === 'application/pdf' && lowerName.endsWith('.pdf')) ||
+    (mimeType === 'text/plain' && (lowerName.endsWith('.txt') || lowerName.endsWith('.md')))
+  if (!extensionMatches) {
+    throw new PublicError(400, 'INVALID_FILE', 'The file extension does not match its type.')
+  }
+
   const bytes = decodeDocumentData(value.data)
 
-  if (mimeType === 'application/pdf' && bytes.subarray(0, 5).toString('ascii') !== '%PDF-') {
-    throw new PublicError(
-      400,
-      'INVALID_PDF',
-      'The uploaded file is not a valid PDF document.',
-    )
+  if (mimeType === 'application/pdf') {
+    const hasHeader = bytes.subarray(0, 5).toString('ascii') === '%PDF-'
+    const hasTrailer = bytes
+      .subarray(Math.max(0, bytes.length - 65_536))
+      .toString('latin1')
+      .includes('%%EOF')
+    if (!hasHeader || !hasTrailer) {
+      throw new PublicError(
+        400,
+        'INVALID_PDF',
+        'The uploaded file is not a valid PDF document.',
+      )
+    }
   }
 
   if (mimeType === 'text/plain') {
@@ -357,6 +421,10 @@ function prepareDocument(value: unknown): PreparedDocument {
         'INVALID_TEXT',
         'The uploaded text document does not contain enough content to analyze.',
       )
+    }
+
+    if (textContent.length > MAX_TEXT_CHARACTERS) {
+      throw new PublicError(413, 'TEXT_TOO_LARGE', 'The document contains too much text to analyze.')
     }
 
     const normalizedText = textContent.replace(/\r\n?/g, '\n')
@@ -399,8 +467,40 @@ function isSeverity(value: unknown): value is Severity {
   return value === 'low' || value === 'medium' || value === 'high'
 }
 
-function parseCitation(value: unknown): Citation | null {
+function normalizeEvidence(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function citationMatchesSource(citation: Citation, document?: PreparedDocument): boolean {
+  if (!document?.textContent) {
+    return true
+  }
+
+  const excerpt = normalizeEvidence(citation.excerpt)
+  const source = normalizeEvidence(document.textContent)
+  if (!excerpt || !source.includes(excerpt)) {
+    return false
+  }
+
+  if (citation.locator.kind === 'text_section') {
+    const lines = document.textContent.split('\n')
+    if (citation.locator.lineEnd > lines.length) {
+      return false
+    }
+    const selectedText = lines.slice(citation.locator.lineStart - 1, citation.locator.lineEnd).join('\n')
+    return normalizeEvidence(selectedText).includes(excerpt)
+  }
+
+  return true
+}
+
+function parseCitation(value: unknown, document?: PreparedDocument): Citation | null {
   if (!isRecord(value) || typeof value.excerpt !== 'string' || !isRecord(value.locator)) {
+    return null
+  }
+
+  const excerpt = value.excerpt.trim()
+  if (!excerpt || excerpt.length > 4000) {
     return null
   }
 
@@ -408,17 +508,20 @@ function parseCitation(value: unknown): Citation | null {
     value.locator.kind === 'pdf_page' &&
     typeof value.locator.page === 'number' &&
     Number.isInteger(value.locator.page) &&
-    value.locator.page >= 1
+    value.locator.page >= 1 &&
+    value.locator.page <= 10000
   ) {
-    return {
-      excerpt: value.excerpt,
-      locator: { kind: 'pdf_page', page: value.locator.page },
+    const citation = {
+      excerpt,
+      locator: { kind: 'pdf_page' as const, page: value.locator.page },
     }
+    return citationMatchesSource(citation, document) ? citation : null
   }
 
   if (
     value.locator.kind === 'text_section' &&
     typeof value.locator.section === 'string' &&
+    value.locator.section.length <= 200 &&
     typeof value.locator.lineStart === 'number' &&
     typeof value.locator.lineEnd === 'number' &&
     Number.isInteger(value.locator.lineStart) &&
@@ -426,27 +529,28 @@ function parseCitation(value: unknown): Citation | null {
     value.locator.lineStart >= 1 &&
     value.locator.lineEnd >= value.locator.lineStart
   ) {
-    return {
-      excerpt: value.excerpt,
+    const citation = {
+      excerpt,
       locator: {
-        kind: 'text_section',
+        kind: 'text_section' as const,
         section: value.locator.section,
         lineStart: value.locator.lineStart,
         lineEnd: value.locator.lineEnd,
       },
     }
+    return citationMatchesSource(citation, document) ? citation : null
   }
 
   return null
 }
 
-function parseCitations(value: unknown): Citation[] {
+function parseCitations(value: unknown, document?: PreparedDocument): Citation[] {
   if (!Array.isArray(value)) {
     return []
   }
 
-  return value.flatMap((item) => {
-    const citation = parseCitation(item)
+  return value.slice(0, MAX_CITATIONS).flatMap((item) => {
+    const citation = parseCitation(item, document)
     return citation ? [citation] : []
   })
 }
@@ -462,6 +566,14 @@ class UnparseableModelResponse extends Error {
 }
 
 function parseModelJson(text: string): unknown {
+  if (text.length > MAX_MODEL_RESPONSE_CHARS) {
+    throw new PublicError(
+      502,
+      'INVALID_AI_RESPONSE',
+      'The AI response was too large to process. Please try again.',
+    )
+  }
+
   const trimmed = text.trim()
   const candidates = [trimmed]
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)
@@ -487,22 +599,65 @@ function parseModelJson(text: string): unknown {
   throw new UnparseableModelResponse(text)
 }
 
-function parseAnalysis(value: unknown): AnalysisResult | null {
+function parseAnalysis(value: unknown, document?: PreparedDocument): AnalysisResult | null {
   if (
     !isRecord(value) ||
     typeof value.documentTitle !== 'string' ||
+    value.documentTitle.trim().length === 0 ||
+    value.documentTitle.length > 300 ||
     typeof value.documentType !== 'string' ||
+    value.documentType.trim().length === 0 ||
+    value.documentType.length > 200 ||
     !isRecord(value.summary) ||
     typeof value.summary.text !== 'string' ||
+    value.summary.text.trim().length === 0 ||
+    value.summary.text.length > MAX_MODEL_TEXT_LENGTH ||
     !Array.isArray(value.keyTerms) ||
+    value.keyTerms.length > MAX_KEY_TERMS ||
     !Array.isArray(value.riskFlags) ||
+    value.riskFlags.length > MAX_RISK_FLAGS ||
     !Array.isArray(value.suggestedQuestions) ||
-    !value.suggestedQuestions.every((question) => typeof question === 'string')
+    value.suggestedQuestions.length > MAX_SUGGESTED_QUESTIONS ||
+    !value.suggestedQuestions.every(
+      (question) =>
+        typeof question === 'string' &&
+        question.trim().length > 0 &&
+        question.length <= MAX_MODEL_TEXT_LENGTH,
+    ) ||
+    !value.keyTerms.every(
+      (term) =>
+        isRecord(term) &&
+        typeof term.term === 'string' &&
+        term.term.trim().length > 0 &&
+        term.term.length <= 500 &&
+        typeof term.value === 'string' &&
+        term.value.trim().length > 0 &&
+        term.value.length <= 2_000 &&
+        typeof term.explanation === 'string' &&
+        term.explanation.trim().length > 0 &&
+        term.explanation.length <= 4_000,
+    ) ||
+    !value.riskFlags.every(
+      (risk) =>
+        isRecord(risk) &&
+        typeof risk.title === 'string' &&
+        risk.title.trim().length > 0 &&
+        risk.title.length <= 500 &&
+        typeof risk.category === 'string' &&
+        risk.category.trim().length > 0 &&
+        risk.category.length <= 500 &&
+        typeof risk.whyItMatters === 'string' &&
+        risk.whyItMatters.trim().length > 0 &&
+        risk.whyItMatters.length <= 4_000 &&
+        typeof risk.suggestedNextStep === 'string' &&
+        risk.suggestedNextStep.trim().length > 0 &&
+        risk.suggestedNextStep.length <= 4_000,
+    )
   ) {
     return null
   }
 
-  const summaryCitations = parseCitations(value.summary.citations)
+  const summaryCitations = parseCitations(value.summary.citations, document)
   if (summaryCitations.length === 0) {
     return null
   }
@@ -518,7 +673,7 @@ function parseAnalysis(value: unknown): AnalysisResult | null {
       return null
     }
 
-    const citations = parseCitations(item.citations)
+    const citations = parseCitations(item.citations, document)
     if (citations.length === 0) {
       continue
     }
@@ -544,7 +699,7 @@ function parseAnalysis(value: unknown): AnalysisResult | null {
       return null
     }
 
-    const citations = parseCitations(item.citations)
+    const citations = parseCitations(item.citations, document)
     if (citations.length === 0) {
       continue
     }
@@ -569,18 +724,26 @@ function parseAnalysis(value: unknown): AnalysisResult | null {
   }
 }
 
-function parseAnswer(value: unknown): AskResult | null {
+function parseAnswer(value: unknown, document?: PreparedDocument): AskResult | null {
   if (
     !isRecord(value) ||
     typeof value.answer !== 'string' ||
+    value.answer.trim().length === 0 ||
+    value.answer.length > MAX_MODEL_TEXT_LENGTH ||
     typeof value.notFound !== 'boolean' ||
     !Array.isArray(value.followUpQuestions) ||
-    !value.followUpQuestions.every((question) => typeof question === 'string')
+    value.followUpQuestions.length > MAX_FOLLOW_UP_QUESTIONS ||
+    !value.followUpQuestions.every(
+      (question) =>
+        typeof question === 'string' &&
+        question.trim().length > 0 &&
+        question.length <= MAX_MODEL_TEXT_LENGTH,
+    )
   ) {
     return null
   }
 
-  const citations = parseCitations(value.citations)
+  const citations = parseCitations(value.citations, document)
   if (!value.notFound && citations.length === 0) {
     return null
   }
@@ -598,9 +761,15 @@ function isLocalDebugEnabled(): boolean {
 }
 
 function redactErrorMessage(message: string): string {
-  return message
+  const configuredKey = process.env.GEMINI_API_KEY?.trim()
+  const withoutConfiguredKey = configuredKey
+    ? message.split(configuredKey).join('[REDACTED_API_KEY]')
+    : message
+
+  return withoutConfiguredKey
     .replace(/AIza[\w-]+/g, '[REDACTED_API_KEY]')
-    .replace(/(api[-_ ]?key\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    .replace(/(api[-_ ]?key\s*[:=]\s*["']?)[^"'\s,;}]+/gi, '$1[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [REDACTED]')
     .slice(0, 1200)
 }
 
@@ -612,9 +781,13 @@ function diagnosticErrorText(text: string): string {
   return isLocalDebugEnabled() ? text : `[${text.length} characters]`
 }
 
+function safeShapeKey(value: string): string {
+  return /^[A-Za-z0-9_.-]{1,40}$/.test(value) ? value : 'field'
+}
+
 function describeResponseShape(value: unknown): string {
   if (Array.isArray(value)) {
-    return `array(${value.length})`
+    return `array(${Math.min(value.length, MAX_CITATIONS)})`
   }
 
   if (!isRecord(value)) {
@@ -622,16 +795,22 @@ function describeResponseShape(value: unknown): string {
   }
 
   return Object.keys(value)
+    .slice(0, 20)
     .sort()
     .map((key) => {
+      const safeKey = safeShapeKey(key)
       const child = value[key]
       if (Array.isArray(child)) {
-        return `${key}:array(${child.length})`
+        return `${safeKey}:array(${Math.min(child.length, MAX_CITATIONS)})`
       }
       if (isRecord(child)) {
-        return `${key}:object(${Object.keys(child).sort().join('|')})`
+        return `${safeKey}:object(${Object.keys(child)
+          .slice(0, 20)
+          .sort()
+          .map(safeShapeKey)
+          .join('|')})`
       }
-      return `${key}:${child === null ? 'null' : typeof child}`
+      return `${safeKey}:${child === null ? 'null' : typeof child}`
     })
     .join(',')
 }
@@ -641,9 +820,18 @@ async function repairJson(
   value: unknown,
   schema: unknown,
   maxOutputTokens: number,
+  context: GenerationContext,
 ): Promise<unknown> {
   const serializedValue =
     typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
+  if (serializedValue.length > MAX_MODEL_RESPONSE_CHARS) {
+    throw new PublicError(
+      502,
+      'INVALID_AI_RESPONSE',
+      'The AI response was too large to repair. Please try again.',
+    )
+  }
+
   const repairContent: Content = {
     role: 'user',
     parts: [
@@ -662,7 +850,7 @@ async function repairJson(
   }
 
   try {
-    return await requestJson(repairContent, schema, maxOutputTokens, FALLBACK_MODEL, false)
+    return await requestJson(repairContent, schema, maxOutputTokens, FALLBACK_MODEL, context)
   } catch (error) {
     if (error instanceof UnparseableModelResponse) {
       console.error('Gemini repair response was unparseable', {
@@ -735,31 +923,43 @@ async function requestJson(
   schema: unknown,
   maxOutputTokens: number,
   model: string,
-  includeSchema: boolean,
+  context: GenerationContext,
 ): Promise<unknown> {
-  const fallbackInstruction = [
+  if (context.calls >= MAX_GENERATION_CALLS) {
+    throw new PublicError(
+      502,
+      'AI_RESPONSE_LIMIT',
+      'The AI response could not be completed within the request budget.',
+    )
+  }
+
+  if (context.signal.aborted) {
+    throw new PublicError(504, 'AI_TIMEOUT', 'The AI request took too long. Please try again.')
+  }
+
+  context.calls += 1
+  const instruction = [
     systemInstruction,
     'Return only one JSON object. Do not wrap the JSON in Markdown.',
     'The JSON object must match this schema:',
     JSON.stringify(schema),
   ].join('\n\n')
-  const config = includeSchema
-    ? {
-        systemInstruction,
-        maxOutputTokens,
-        responseMimeType: 'application/json',
-        responseJsonSchema: schema,
-      }
-    : {
-        systemInstruction: fallbackInstruction,
-        maxOutputTokens,
-        responseMimeType: 'application/json',
-      }
 
   const response = await getClient().models.generateContent({
     model,
     contents: [content],
-    config,
+    config: {
+      systemInstruction: instruction,
+      maxOutputTokens,
+      candidateCount: 1,
+      responseMimeType: 'application/json',
+      abortSignal: context.signal,
+    },
+  }).catch((error: unknown) => {
+    if (context.signal.aborted) {
+      throw new PublicError(504, 'AI_TIMEOUT', 'The AI request took too long. Please try again.')
+    }
+    throw error
   })
 
   if (response.promptFeedback?.blockReason) {
@@ -782,32 +982,44 @@ async function requestJson(
   return parseModelJson(response.text)
 }
 
+function createGenerationContext(): GenerationContext {
+  return {
+    signal: AbortSignal.timeout(GENERATION_DEADLINE_MS),
+    calls: 0,
+  }
+}
+
 async function generateJson(
   content: Content,
   schema: unknown,
   maxOutputTokens: number,
+  context: GenerationContext,
 ): Promise<unknown> {
+  const primaryModel = getModel()
   try {
-    return await requestJson(content, schema, maxOutputTokens, getModel(), false)
+    return await requestJson(content, schema, maxOutputTokens, primaryModel, context)
   } catch (error) {
     if (error instanceof UnparseableModelResponse) {
       console.error('Retrying Gemini request after unparseable JSON', {
         textLength: error.text.length,
         text: diagnosticErrorText(error.text),
       })
-      return repairJson(content, error.text, schema, maxOutputTokens)
+      return repairJson(content, error.text, schema, maxOutputTokens, context)
     }
 
-    if (
-      !(error instanceof ApiError) ||
-      (error.status !== 400 &&
-        error.status !== 429 &&
-        error.status !== 500 &&
-        error.status !== 502 &&
-        error.status !== 503 &&
-        error.status !== 504)
-    ) {
+    const canFallback =
+      primaryModel !== FALLBACK_MODEL &&
+      error instanceof ApiError &&
+      (error.status === 429 ||
+        error.status >= 500 ||
+        (error.status === 400 && primaryModel !== DEFAULT_MODEL))
+    if (!canFallback) {
       throw mapGeminiError(error)
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, FALLBACK_DELAY_MS))
+    if (context.signal.aborted) {
+      throw new PublicError(504, 'AI_TIMEOUT', 'The AI request took too long. Please try again.')
     }
 
     console.error('Retrying Gemini request with fallback model', {
@@ -817,14 +1029,14 @@ async function generateJson(
     })
 
     try {
-      return await requestJson(content, schema, maxOutputTokens, FALLBACK_MODEL, false)
+      return await requestJson(content, schema, maxOutputTokens, FALLBACK_MODEL, context)
     } catch (fallbackError) {
       if (fallbackError instanceof UnparseableModelResponse) {
         console.error('Retrying Gemini request after fallback JSON parse failure', {
           textLength: fallbackError.text.length,
           text: diagnosticErrorText(fallbackError.text),
         })
-        return repairJson(content, fallbackError.text, schema, maxOutputTokens)
+        return repairJson(content, fallbackError.text, schema, maxOutputTokens, context)
       }
       throw mapGeminiError(fallbackError)
     }
@@ -842,15 +1054,16 @@ export async function analyzeRequestBody(body: unknown): Promise<AnalysisResult>
       'Use three to five suggested questions that would help the reader inspect important parts of this specific document.',
     ].join(' '),
   )
-  let result = await generateJson(content, analysisSchema, 8192)
-  let analysis = parseAnalysis(result)
+  const context = createGenerationContext()
+  let result = await generateJson(content, analysisSchema, 8192, context)
+  let analysis = parseAnalysis(result, document)
 
   if (!analysis) {
     console.error('Gemini analysis response failed validation', {
       shape: describeResponseShape(result),
     })
-    result = await repairJson(content, result, analysisSchema, 8192)
-    analysis = parseAnalysis(result)
+    result = await repairJson(content, result, analysisSchema, 8192, context)
+    analysis = parseAnalysis(result, document)
   }
 
   if (!analysis) {
@@ -934,15 +1147,16 @@ export async function askRequestBody(body: unknown): Promise<AskResult> {
       `CURRENT QUESTION\n${question}`,
     ].join(' '),
   )
-  let result = await generateJson(content, answerSchema, 4096)
-  let answer = parseAnswer(result)
+  const context = createGenerationContext()
+  let result = await generateJson(content, answerSchema, 4096, context)
+  let answer = parseAnswer(result, document)
 
   if (!answer) {
     console.error('Gemini answer response failed validation', {
       shape: describeResponseShape(result),
     })
-    result = await repairJson(content, result, answerSchema, 4096)
-    answer = parseAnswer(result)
+    result = await repairJson(content, result, answerSchema, 4096, context)
+    answer = parseAnswer(result, document)
   }
 
   if (!answer) {
@@ -959,14 +1173,118 @@ export async function askRequestBody(body: unknown): Promise<AskResult> {
   return answer
 }
 
+function getRequestHeader(request: ApiRequest, name: string): string | undefined {
+  const wanted = name.toLowerCase()
+  for (const [key, value] of Object.entries(request.headers ?? {})) {
+    if (key.toLowerCase() !== wanted || value === undefined) {
+      continue
+    }
+    return Array.isArray(value) ? value[0] : value
+  }
+  return undefined
+}
+
+function setApiResponseHeaders(response: ApiResponse): void {
+  response.setHeader('Cache-Control', 'no-store')
+  response.setHeader('X-Content-Type-Options', 'nosniff')
+  response.setHeader('X-Frame-Options', 'DENY')
+  response.setHeader('Referrer-Policy', 'no-referrer')
+  response.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
+}
+
+function getRequestAddress(request: ApiRequest): string {
+  const forwarded = getRequestHeader(request, 'x-forwarded-for')?.split(',')[0]?.trim()
+  return forwarded || getRequestHeader(request, 'x-real-ip')?.trim() || 'unknown'
+}
+
+function enforceRateLimit(request: ApiRequest): void {
+  const now = Date.now()
+  for (const [address, bucket] of requestBuckets) {
+    if (bucket.resetAt <= now) {
+      requestBuckets.delete(address)
+    }
+  }
+
+  if (requestBuckets.size >= 10_000) {
+    const oldest = requestBuckets.keys().next()
+    if (!oldest.done) {
+      requestBuckets.delete(oldest.value)
+    }
+  }
+
+  const address = getRequestAddress(request)
+  const current = requestBuckets.get(address)
+  const bucket = !current || current.resetAt <= now
+    ? { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS }
+    : current
+
+  if (bucket.count >= RATE_LIMIT_MAX_REQUESTS) {
+    throw new PublicError(429, 'RATE_LIMITED', 'Too many requests. Please wait a moment and try again.')
+  }
+
+  bucket.count += 1
+  requestBuckets.set(address, bucket)
+}
+
+function normalizeOrigin(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined
+  }
+
+  try {
+    const parsed = new URL(value)
+    return `${parsed.protocol}//${parsed.host}`.toLowerCase()
+  } catch {
+    return undefined
+  }
+}
+
+function assertAllowedOrigin(request: ApiRequest): void {
+  const rawOrigin = getRequestHeader(request, 'origin')
+  if (!rawOrigin) {
+    return
+  }
+
+  const origin = normalizeOrigin(rawOrigin)
+  const configuredOrigin = normalizeOrigin(process.env.APP_ORIGIN)
+  const host = getRequestHeader(request, 'x-forwarded-host') || getRequestHeader(request, 'host')
+  const originProtocol = origin?.split(':', 1)[0]
+  const protocol =
+    getRequestHeader(request, 'x-forwarded-proto')?.split(',')[0]?.trim() || originProtocol || 'https'
+  const requestOrigin = host ? normalizeOrigin(`${protocol}://${host}`) : undefined
+  const allowedOrigin = configuredOrigin || requestOrigin
+
+  if (!origin || (allowedOrigin && origin !== allowedOrigin)) {
+    throw new PublicError(403, 'ORIGIN_NOT_ALLOWED', 'This request origin is not allowed.')
+  }
+}
+
 export function requirePost(request: ApiRequest, response: ApiResponse): void {
+  setApiResponseHeaders(response)
   if (request.method !== 'POST') {
     response.setHeader('Allow', 'POST')
     throw new PublicError(405, 'METHOD_NOT_ALLOWED', 'Use the POST method for this endpoint.')
   }
 }
 
+export function requireApiRequest(request: ApiRequest, response: ApiResponse): void {
+  requirePost(request, response)
+  assertAllowedOrigin(request)
+  enforceRateLimit(request)
+
+  const contentLength = getRequestHeader(request, 'content-length')?.trim()
+  if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_REQUEST_BODY_CHARS) {
+    throw new PublicError(413, 'REQUEST_TOO_LARGE', 'The request is too large.')
+  }
+
+  const contentType = getRequestHeader(request, 'content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+  if (contentType !== 'application/json') {
+    throw new PublicError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Send the request as application/json.')
+  }
+}
+
 export function sendApiError(response: ApiResponse, error: unknown): void {
+  setApiResponseHeaders(response)
   const publicError =
     error instanceof PublicError
       ? error
