@@ -598,11 +598,23 @@ function parseAnswer(value: unknown): AskResult | null {
   }
 }
 
+function isLocalDebugEnabled(): boolean {
+  return process.env.NODE_ENV !== 'production' && process.env.DEBUG_GEMINI_ERRORS === 'true'
+}
+
 function redactErrorMessage(message: string): string {
   return message
     .replace(/AIza[\w-]+/g, '[REDACTED_API_KEY]')
     .replace(/(api[-_ ]?key\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
     .slice(0, 1200)
+}
+
+function diagnosticErrorMessage(message: string): string {
+  return isLocalDebugEnabled() ? message : redactErrorMessage(message)
+}
+
+function diagnosticErrorText(text: string): string {
+  return isLocalDebugEnabled() ? text : `[${text.length} characters]`
 }
 
 function describeResponseShape(value: unknown): string {
@@ -669,7 +681,7 @@ function mapGeminiError(error: unknown): PublicError {
   if (error instanceof ApiError) {
     console.error('Gemini API request failed', {
       status: error.status,
-      message: redactErrorMessage(error.message),
+      message: diagnosticErrorMessage(error.message),
     })
     if (error.status === 429) {
       return new PublicError(
@@ -701,6 +713,9 @@ function mapGeminiError(error: unknown): PublicError {
 
   console.error('Unexpected AI service failure', {
     type: error instanceof Error ? error.name : 'UnknownError',
+    ...(error instanceof Error && isLocalDebugEnabled()
+      ? { message: error.message, stack: error.stack }
+      : {}),
   })
   return new PublicError(
     502,
@@ -772,6 +787,7 @@ async function generateJson(
     if (error instanceof UnparseableModelResponse) {
       console.error('Retrying Gemini request after unparseable JSON', {
         textLength: error.text.length,
+        text: diagnosticErrorText(error.text),
       })
       return repairJson(content, error.text, schema, maxOutputTokens)
     }
@@ -783,7 +799,7 @@ async function generateJson(
     console.error('Retrying Gemini request without structured output', {
       model: FALLBACK_MODEL,
       status: error.status,
-      message: redactErrorMessage(error.message),
+      message: diagnosticErrorMessage(error.message),
     })
 
     try {
@@ -792,6 +808,7 @@ async function generateJson(
       if (fallbackError instanceof UnparseableModelResponse) {
         console.error('Retrying Gemini request after fallback JSON parse failure', {
           textLength: fallbackError.text.length,
+          text: diagnosticErrorText(fallbackError.text),
         })
         return repairJson(content, fallbackError.text, schema, maxOutputTokens)
       }
