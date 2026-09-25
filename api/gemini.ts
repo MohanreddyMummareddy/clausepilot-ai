@@ -561,13 +561,23 @@ function parseAnswer(value: unknown): AskResult | null {
   }
 }
 
+function redactErrorMessage(message: string): string {
+  return message
+    .replace(/AIza[\w-]+/g, '[REDACTED_API_KEY]')
+    .replace(/(api[-_ ]?key\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    .slice(0, 1200)
+}
+
 function mapGeminiError(error: unknown): PublicError {
   if (error instanceof PublicError) {
     return error
   }
 
   if (error instanceof ApiError) {
-    console.error('Gemini API request failed', { status: error.status })
+    console.error('Gemini API request failed', {
+      status: error.status,
+      message: redactErrorMessage(error.message),
+    })
     if (error.status === 429) {
       return new PublicError(
         429,
@@ -617,7 +627,6 @@ async function generateJson(
       contents: [content],
       config: {
         systemInstruction,
-        temperature: 0.15,
         maxOutputTokens,
         responseMimeType: 'application/json',
         responseJsonSchema: schema,
