@@ -10,8 +10,8 @@ import type {
 } from '../src/types.js'
 
 const MAX_DOCUMENT_BYTES = 3 * 1024 * 1024
-const DEFAULT_MODEL = 'gemini-3.8-flash'
-const FALLBACK_MODEL = 'gemini-3.5-flash'
+const DEFAULT_MODEL = 'gemini-3.5-flash-lite'
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite-preview'
 
 const citationSchema = {
   type: 'object',
@@ -192,6 +192,7 @@ const systemInstruction = [
   'Use only facts explicitly supported by the supplied document.',
   'Do not invent terms, dates, obligations, risks, page numbers, headings, or quotations.',
   'Every citation excerpt must be a contiguous verbatim source excerpt without an ellipsis.',
+  'Each citation must contain exactly one excerpt and one locator object; never place a citation or locator array inside another citation.',
   'For PDFs, page is the one-based physical PDF page number.',
   'For text files, section is the exact source heading or [unheaded], and line numbers are one-based source line numbers excluding the artificial line-number prefixes.',
   'Describe potential concerns neutrally and never present the output as legal advice.',
@@ -439,21 +440,15 @@ function parseCitation(value: unknown): Citation | null {
   return null
 }
 
-function parseCitations(value: unknown): Citation[] | null {
+function parseCitations(value: unknown): Citation[] {
   if (!Array.isArray(value)) {
-    return null
+    return []
   }
 
-  const citations: Citation[] = []
-  for (const item of value) {
+  return value.flatMap((item) => {
     const citation = parseCitation(item)
-    if (!citation) {
-      return null
-    }
-    citations.push(citation)
-  }
-
-  return citations
+    return citation ? [citation] : []
+  })
 }
 
 class UnparseableModelResponse extends Error {
@@ -508,7 +503,7 @@ function parseAnalysis(value: unknown): AnalysisResult | null {
   }
 
   const summaryCitations = parseCitations(value.summary.citations)
-  if (!summaryCitations || summaryCitations.length === 0) {
+  if (summaryCitations.length === 0) {
     return null
   }
 
@@ -524,8 +519,8 @@ function parseAnalysis(value: unknown): AnalysisResult | null {
     }
 
     const citations = parseCitations(item.citations)
-    if (!citations || citations.length === 0) {
-      return null
+    if (citations.length === 0) {
+      continue
     }
 
     keyTerms.push({
@@ -550,8 +545,8 @@ function parseAnalysis(value: unknown): AnalysisResult | null {
     }
 
     const citations = parseCitations(item.citations)
-    if (!citations || citations.length === 0) {
-      return null
+    if (citations.length === 0) {
+      continue
     }
 
     riskFlags.push({
@@ -586,7 +581,7 @@ function parseAnswer(value: unknown): AskResult | null {
   }
 
   const citations = parseCitations(value.citations)
-  if (!citations) {
+  if (!value.notFound && citations.length === 0) {
     return null
   }
 
@@ -669,6 +664,17 @@ async function repairJson(
   try {
     return await requestJson(repairContent, schema, maxOutputTokens, FALLBACK_MODEL, false)
   } catch (error) {
+    if (error instanceof UnparseableModelResponse) {
+      console.error('Gemini repair response was unparseable', {
+        textLength: error.text.length,
+        text: diagnosticErrorText(error.text),
+      })
+      throw new PublicError(
+        502,
+        'INVALID_AI_RESPONSE',
+        'The AI response did not match the required format. Please try again.',
+      )
+    }
     throw mapGeminiError(error)
   }
 }
@@ -782,7 +788,7 @@ async function generateJson(
   maxOutputTokens: number,
 ): Promise<unknown> {
   try {
-    return await requestJson(content, schema, maxOutputTokens, getModel(), true)
+    return await requestJson(content, schema, maxOutputTokens, getModel(), false)
   } catch (error) {
     if (error instanceof UnparseableModelResponse) {
       console.error('Retrying Gemini request after unparseable JSON', {
@@ -792,11 +798,19 @@ async function generateJson(
       return repairJson(content, error.text, schema, maxOutputTokens)
     }
 
-    if (!(error instanceof ApiError) || error.status !== 400) {
+    if (
+      !(error instanceof ApiError) ||
+      (error.status !== 400 &&
+        error.status !== 429 &&
+        error.status !== 500 &&
+        error.status !== 502 &&
+        error.status !== 503 &&
+        error.status !== 504)
+    ) {
       throw mapGeminiError(error)
     }
 
-    console.error('Retrying Gemini request without structured output', {
+    console.error('Retrying Gemini request with fallback model', {
       model: FALLBACK_MODEL,
       status: error.status,
       message: diagnosticErrorMessage(error.message),
