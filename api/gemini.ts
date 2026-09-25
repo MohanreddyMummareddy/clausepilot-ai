@@ -456,6 +456,42 @@ function parseCitations(value: unknown): Citation[] | null {
   return citations
 }
 
+class UnparseableModelResponse extends Error {
+  readonly text: string
+
+  constructor(text: string) {
+    super('The AI response was not valid JSON.')
+    this.name = 'UnparseableModelResponse'
+    this.text = text
+  }
+}
+
+function parseModelJson(text: string): unknown {
+  const trimmed = text.trim()
+  const candidates = [trimmed]
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)
+
+  if (fenced?.[1]) {
+    candidates.push(fenced[1].trim())
+  }
+
+  const firstObject = trimmed.indexOf('{')
+  const lastObject = trimmed.lastIndexOf('}')
+  if (firstObject >= 0 && lastObject > firstObject) {
+    candidates.push(trimmed.slice(firstObject, lastObject + 1))
+  }
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as unknown
+    } catch {
+      continue
+    }
+  }
+
+  throw new UnparseableModelResponse(text)
+}
+
 function parseAnalysis(value: unknown): AnalysisResult | null {
   if (
     !isRecord(value) ||
@@ -599,7 +635,8 @@ async function repairJson(
   schema: unknown,
   maxOutputTokens: number,
 ): Promise<unknown> {
-  const serializedValue = JSON.stringify(value)
+  const serializedValue =
+    typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
   const repairContent: Content = {
     role: 'user',
     parts: [
@@ -721,7 +758,7 @@ async function requestJson(
     )
   }
 
-  return JSON.parse(response.text) as unknown
+  return parseModelJson(response.text)
 }
 
 async function generateJson(
@@ -732,6 +769,13 @@ async function generateJson(
   try {
     return await requestJson(content, schema, maxOutputTokens, getModel(), true)
   } catch (error) {
+    if (error instanceof UnparseableModelResponse) {
+      console.error('Retrying Gemini request after unparseable JSON', {
+        textLength: error.text.length,
+      })
+      return repairJson(content, error.text, schema, maxOutputTokens)
+    }
+
     if (!(error instanceof ApiError) || error.status !== 400) {
       throw mapGeminiError(error)
     }
@@ -745,6 +789,12 @@ async function generateJson(
     try {
       return await requestJson(content, schema, maxOutputTokens, FALLBACK_MODEL, false)
     } catch (fallbackError) {
+      if (fallbackError instanceof UnparseableModelResponse) {
+        console.error('Retrying Gemini request after fallback JSON parse failure', {
+          textLength: fallbackError.text.length,
+        })
+        return repairJson(content, fallbackError.text, schema, maxOutputTokens)
+      }
       throw mapGeminiError(fallbackError)
     }
   }
