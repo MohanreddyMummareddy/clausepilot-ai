@@ -11,6 +11,7 @@ import type {
 
 const MAX_DOCUMENT_BYTES = 3 * 1024 * 1024
 const DEFAULT_MODEL = 'gemini-3.8-flash'
+const FALLBACK_MODEL = 'gemini-3.5-flash'
 
 const citationSchema = {
   type: 'object',
@@ -616,43 +617,81 @@ function mapGeminiError(error: unknown): PublicError {
   )
 }
 
+async function requestJson(
+  content: Content,
+  schema: unknown,
+  maxOutputTokens: number,
+  model: string,
+  includeSchema: boolean,
+): Promise<unknown> {
+  const fallbackInstruction = [
+    systemInstruction,
+    'Return only one JSON object. Do not wrap the JSON in Markdown.',
+    'The JSON object must match this schema:',
+    JSON.stringify(schema),
+  ].join('\n\n')
+  const config = includeSchema
+    ? {
+        systemInstruction,
+        maxOutputTokens,
+        responseMimeType: 'application/json',
+        responseJsonSchema: schema,
+      }
+    : {
+        systemInstruction: fallbackInstruction,
+        maxOutputTokens,
+        responseMimeType: 'application/json',
+      }
+
+  const response = await getClient().models.generateContent({
+    model,
+    contents: [content],
+    config,
+  })
+
+  if (response.promptFeedback?.blockReason) {
+    throw new PublicError(
+      422,
+      'DOCUMENT_REJECTED',
+      'The document could not be analyzed. Try a different file.',
+    )
+  }
+
+  const candidate = response.candidates?.[0]
+  if (!candidate || candidate.finishReason !== 'STOP' || !response.text) {
+    throw new PublicError(
+      502,
+      'INCOMPLETE_RESPONSE',
+      'The AI returned an incomplete response. Please try again.',
+    )
+  }
+
+  return JSON.parse(response.text) as unknown
+}
+
 async function generateJson(
   content: Content,
   schema: unknown,
   maxOutputTokens: number,
 ): Promise<unknown> {
   try {
-    const response = await getClient().models.generateContent({
-      model: getModel(),
-      contents: [content],
-      config: {
-        systemInstruction,
-        maxOutputTokens,
-        responseMimeType: 'application/json',
-        responseJsonSchema: schema,
-      },
+    return await requestJson(content, schema, maxOutputTokens, getModel(), true)
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 400) {
+      throw mapGeminiError(error)
+    }
+
+    console.error('Retrying Gemini request without structured output', {
+      model: FALLBACK_MODEL,
+      status: error.status,
+      message: redactErrorMessage(error.message),
     })
 
-    if (response.promptFeedback?.blockReason) {
-      throw new PublicError(
-        422,
-        'DOCUMENT_REJECTED',
-        'The document could not be analyzed. Try a different file.',
-      )
+    try {
+      return await requestJson(content, schema, maxOutputTokens, FALLBACK_MODEL, false)
+    } catch (fallbackError) {
+      throw mapGeminiError(fallbackError)
     }
-
-    const candidate = response.candidates?.[0]
-    if (!candidate || candidate.finishReason !== 'STOP' || !response.text) {
-      throw new PublicError(
-        502,
-        'INCOMPLETE_RESPONSE',
-        'The AI returned an incomplete response. Please try again.',
-      )
-    }
-
-    return JSON.parse(response.text) as unknown
-  } catch (error) {
-    throw mapGeminiError(error)
   }
 }
 
